@@ -1,9 +1,10 @@
 plugins {
-    id("java")
+    `java-library`
+    `maven-publish`
 }
 
-group = "com.dractical"
-version = "0.1"
+group = "com.github.dractical"
+version = "0.1.0"
 
 repositories {
     mavenCentral()
@@ -16,4 +17,16 @@ dependencies {
 
 tasks.test {
     useJUnitPlatform()
+}
+
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(21)) // or 17
+    }
+    withSourcesJar()
+    withJavadocJar()
+}
+
+tasks.withType<JavaCompile>().configureEach {
+    options.encoding = "UTF-8"
 }

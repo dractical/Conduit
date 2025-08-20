@@ -1,0 +1,5 @@
+jdk:
+  - temurin-21
+
+install:
+  - ./gradlew clean -Pgroup=com.github.dractical -Pversion=${VERSION} -x test publishToMavenLocal
