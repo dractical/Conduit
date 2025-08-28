@@ -25,6 +25,39 @@ class EventBusTest {
         }
     }
 
+    interface BaseIface {
+        void incBase();
+
+        @Subscribe
+        default void onBase(TestEvent e) {
+            incBase();
+        }
+    }
+
+    interface SubIface extends BaseIface {
+        void incSub();
+
+        @Subscribe
+        default void onSub(TestEvent e) {
+            incSub();
+        }
+    }
+
+    static class InterfaceListener implements SubIface {
+        int baseCalls = 0;
+        int subCalls = 0;
+
+        @Override
+        public void incBase() {
+            baseCalls++;
+        }
+
+        @Override
+        public void incSub() {
+            subCalls++;
+        }
+    }
+
     @Test
     void duplicateRegistrationIgnored() {
         EventBus bus = new EventBus();
@@ -68,6 +101,16 @@ class EventBusTest {
         } finally {
             exec.shutdownNow();
         }
+    }
+
+    @Test
+    void interfaceMethodsRegistered() {
+        EventBus bus = new EventBus();
+        InterfaceListener listener = new InterfaceListener();
+        bus.register(listener);
+        bus.post(new TestEvent());
+        assertEquals(1, listener.baseCalls);
+        assertEquals(1, listener.subCalls);
     }
 }
 

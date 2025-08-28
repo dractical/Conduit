@@ -2,12 +2,13 @@ package com.dractical.conduit;
 
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
+import java.lang.ref.Reference;
+import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -33,8 +34,9 @@ public final class EventBus {
         final boolean once;
         final long seq;
 
-        Handler(Object listener, Method method, MethodHandle handle, Class<?> paramType, Subscribe meta, long seq) {
-            this.listener = new WeakReference<>(listener);
+        Handler(Object listener, ReferenceQueue<Object> queue, Method method, MethodHandle handle,
+                Class<?> paramType, Subscribe meta, long seq) {
+            this.listener = new WeakReference<>(listener, queue);
             this.method = method;
             this.handle = handle;
             this.paramType = paramType;
@@ -60,8 +62,11 @@ public final class EventBus {
     }
 
     private final ConcurrentMap<Class<?>, CopyOnWriteArraySet<Handler>> handlersByType = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Class<?>, List<Handler>> handlerLookup = new ConcurrentHashMap<>();
     private final ConcurrentMap<Class<?>, List<Handler>> dispatchCache = new ConcurrentHashMap<>();
+    private final ConcurrentMap<Object, Set<Handler>> handlersByListener = new ConcurrentHashMap<>();
     private final AtomicLong sequence = new AtomicLong(0);
+    private final ReferenceQueue<Object> refQueue = new ReferenceQueue<>();
 
     private final Executor executor;
     private final ErrorHandler errorHandler;
@@ -92,9 +97,16 @@ public final class EventBus {
      */
     public void register(Object listener) {
         Objects.requireNonNull(listener, "listener");
+        drainQueue();
         int found = 0;
-        boolean added = false;
-        for (Class<?> cls = listener.getClass(); cls != Object.class; cls = cls.getSuperclass()) {
+        Set<Class<?>> addedTypes = new HashSet<>();
+        Set<Class<?>> visited = new HashSet<>();
+        ArrayDeque<Class<?>> queue = new ArrayDeque<>();
+        queue.add(listener.getClass());
+        while (!queue.isEmpty()) {
+            Class<?> cls = queue.removeFirst();
+            if (cls == Object.class || !visited.add(cls)) continue;
+
             for (Method m : cls.getDeclaredMethods()) {
                 Subscribe ann = m.getAnnotation(Subscribe.class);
                 if (ann == null) continue;
@@ -117,18 +129,25 @@ public final class EventBus {
                     throw new IllegalArgumentException("Failed to access @Subscribe method: "
                             + cls.getName() + "#" + m.getName(), e);
                 }
-                Handler h = new Handler(listener, m, handle, paramType, ann, sequence.getAndIncrement());
+                Handler h = new Handler(listener, refQueue, m, handle, paramType, ann, sequence.getAndIncrement());
                 CopyOnWriteArraySet<Handler> set = handlersByType.computeIfAbsent(paramType, k -> new CopyOnWriteArraySet<>());
                 if (set.add(h)) {
-                    added = true;
+                    addedTypes.add(paramType);
                 }
+                handlersByListener.computeIfAbsent(listener, k -> ConcurrentHashMap.newKeySet()).add(h);
                 found++;
             }
+
+            Class<?> superCls = cls.getSuperclass();
+            if (superCls != null) queue.add(superCls);
+            Collections.addAll(queue, cls.getInterfaces());
         }
         if (found == 0) {
             throw new IllegalArgumentException("No @Subscribe methods found on " + listener.getClass().getName());
         }
-        if (added) invalidateCache();
+        for (Class<?> type : addedTypes) {
+            rebuildHandlerLookup(type);
+        }
     }
 
     /**
@@ -136,17 +155,24 @@ public final class EventBus {
      */
     public void unregister(Object listener) {
         Objects.requireNonNull(listener, "listener");
-        boolean changed = false;
-        for (Map.Entry<Class<?>, CopyOnWriteArraySet<Handler>> e : handlersByType.entrySet()) {
-            CopyOnWriteArraySet<Handler> set = e.getValue();
-            if (set.removeIf(h -> h.listener.get() == listener)) {
-                changed = true;
+        drainQueue();
+        Set<Handler> owned = handlersByListener.remove(listener);
+        if (owned == null || owned.isEmpty()) {
+            return;
+        }
+        Set<Class<?>> changedTypes = new HashSet<>();
+        for (Handler h : owned) {
+            CopyOnWriteArraySet<Handler> set = handlersByType.get(h.paramType);
+            if (set != null && set.remove(h)) {
+                changedTypes.add(h.paramType);
                 if (set.isEmpty()) {
-                    handlersByType.remove(e.getKey(), set);
+                    handlersByType.remove(h.paramType, set);
                 }
             }
         }
-        if (changed) invalidateCache();
+        for (Class<?> type : changedTypes) {
+            rebuildHandlerLookup(type);
+        }
     }
 
     /**
@@ -154,6 +180,7 @@ public final class EventBus {
      */
     public <E extends Event> E post(E event) {
         Objects.requireNonNull(event, "event");
+        drainQueue();
         List<Handler> toCall = resolveHandlers(event.getClass());
         if (toCall.isEmpty()) {
             if (!(event instanceof DeadEvent)) {
@@ -165,7 +192,9 @@ public final class EventBus {
             return event;
         }
 
-        boolean mutated = false;
+        Set<Class<?>> mutatedTypes = new HashSet<>();
+        boolean isCancellable = event instanceof Cancellable;
+        Cancellable c = isCancellable ? (Cancellable) event : null;
         for (Handler h : toCall) {
             Object target = h.listener.get();
             if (target == null) {
@@ -175,13 +204,12 @@ public final class EventBus {
                         handlersByType.remove(h.paramType, set);
                     }
                 }
-                mutated = true;
+                removeHandlerFromListenerMap(h, null);
+                mutatedTypes.add(h.paramType);
                 continue;
             }
-            if (event instanceof Cancellable) {
-                if (((Cancellable) event).isCancelled() && h.ignoreCancelled) {
-                    continue;
-                }
+            if (isCancellable && c.isCancelled() && h.ignoreCancelled) {
+                continue;
             }
             try {
                 h.handle.invoke(target, event);
@@ -193,12 +221,15 @@ public final class EventBus {
                 if (set != null) {
                     if (set.remove(h)) {
                         if (set.isEmpty()) handlersByType.remove(h.paramType, set);
-                        mutated = true;
+                        mutatedTypes.add(h.paramType);
                     }
                 }
+                removeHandlerFromListenerMap(h, target);
             }
         }
-        if (mutated) invalidateCache();
+        for (Class<?> type : mutatedTypes) {
+            rebuildHandlerLookup(type);
+        }
         return event;
     }
 
@@ -207,6 +238,7 @@ public final class EventBus {
      */
     public <E extends Event> CompletableFuture<E> postAsync(E event) {
         Objects.requireNonNull(event, "event");
+        drainQueue();
         if (executor == null) {
             throw new IllegalStateException("No Executor configured. Use new EventBus(Executor) or post(...) instead.");
         }
@@ -223,51 +255,112 @@ public final class EventBus {
             return CompletableFuture.completedFuture(event);
         }
 
-        ArrayList<CompletableFuture<?>> futures = new ArrayList<>(toCall.size());
-        AtomicBoolean mutated = new AtomicBoolean(false);
+        boolean isCancellable = event instanceof Cancellable;
+        Cancellable c = isCancellable ? (Cancellable) event : null;
 
-        for (Handler h : toCall) {
-            CompletableFuture<?> cf = CompletableFuture.runAsync(() -> {
+        return CompletableFuture.supplyAsync(() -> {
+            Set<Class<?>> mutatedTypes = new HashSet<>();
+            ArrayList<HandlerError> errors = new ArrayList<>();
+            for (Handler h : toCall) {
                 Object target = h.listener.get();
                 if (target == null) {
                     CopyOnWriteArraySet<Handler> set = handlersByType.get(h.paramType);
                     if (set != null && set.remove(h) && set.isEmpty()) {
                         handlersByType.remove(h.paramType, set);
                     }
-                    mutated.set(true);
-                    return;
+                    removeHandlerFromListenerMap(h, null);
+                    mutatedTypes.add(h.paramType);
+                    continue;
                 }
-                if (event instanceof Cancellable) {
-                    if (((Cancellable) event).isCancelled() && h.ignoreCancelled) {
-                        return;
-                    }
+                if (isCancellable && c.isCancelled() && h.ignoreCancelled) {
+                    continue;
                 }
                 try {
                     h.handle.invoke(target, event);
                 } catch (Throwable t) {
-                    errorHandler.onHandlerException(event, target, h.method, t);
+                    errors.add(new HandlerError(target, h.method, t));
                 }
                 if (h.once) {
                     CopyOnWriteArraySet<Handler> set = handlersByType.get(h.paramType);
                     if (set != null && set.remove(h) && set.isEmpty()) {
                         handlersByType.remove(h.paramType, set);
                     }
-                    mutated.set(true);
+                    removeHandlerFromListenerMap(h, target);
+                    mutatedTypes.add(h.paramType);
                 }
-            }, executor);
-            futures.add(cf);
-        }
-
-        return CompletableFuture
-                .allOf(futures.toArray(new CompletableFuture[0]))
-                .thenApply(v -> {
-                    if (mutated.get()) invalidateCache();
-                    return event;
-                });
+            }
+            mutatedTypes.forEach(EventBus.this::rebuildHandlerLookup);
+            for (HandlerError err : errors) {
+                errorHandler.onHandlerException(event, err.listener, err.method, err.error);
+            }
+            return event;
+        }, executor);
     }
 
-    private void invalidateCache() {
-        dispatchCache.clear();
+    private record HandlerError(Object listener, Method method, Throwable error) {
+    }
+
+    private void rebuildHandlerLookup(Class<?> type) {
+        CopyOnWriteArraySet<Handler> set = handlersByType.get(type);
+        if (set == null || set.isEmpty()) {
+            handlersByType.remove(type, set);
+            handlerLookup.remove(type);
+        } else {
+            ArrayList<Handler> list = new ArrayList<>(set);
+            list.sort(Comparator
+                    .comparingInt((Handler h) -> h.priority.weight())
+                    .thenComparingLong(h -> h.seq));
+            handlerLookup.put(type, Collections.unmodifiableList(list));
+        }
+        dispatchCache.keySet().removeIf(type::isAssignableFrom);
+    }
+
+    private void removeHandlerFromListenerMap(Handler h, Object listener) {
+        if (listener != null) {
+            Set<Handler> set = handlersByListener.get(listener);
+            if (set != null) {
+                set.remove(h);
+                if (set.isEmpty()) {
+                    handlersByListener.remove(listener, set);
+                }
+            }
+        } else {
+            for (Map.Entry<Object, Set<Handler>> e : handlersByListener.entrySet()) {
+                Set<Handler> set = e.getValue();
+                if (set.remove(h)) {
+                    if (set.isEmpty()) {
+                        handlersByListener.remove(e.getKey(), set);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    private void drainQueue() {
+        Reference<?> ref;
+        Set<Class<?>> changedTypes = new HashSet<>();
+        while ((ref = refQueue.poll()) != null) {
+            Reference<?> r = ref;
+            for (Map.Entry<Class<?>, CopyOnWriteArraySet<Handler>> e : handlersByType.entrySet()) {
+                CopyOnWriteArraySet<Handler> set = e.getValue();
+                if (set.removeIf(h -> {
+                    if (h.listener == r) {
+                        removeHandlerFromListenerMap(h, null);
+                        return true;
+                    }
+                    return false;
+                })) {
+                    changedTypes.add(e.getKey());
+                    if (set.isEmpty()) {
+                        handlersByType.remove(e.getKey(), set);
+                    }
+                }
+            }
+        }
+        for (Class<?> type : changedTypes) {
+            rebuildHandlerLookup(type);
+        }
     }
 
     private List<Handler> resolveHandlers(Class<?> eventClass) {
@@ -275,15 +368,27 @@ public final class EventBus {
     }
 
     private List<Handler> computeHandlersFor(Class<?> eventClass) {
-        if (handlersByType.isEmpty()) return Collections.emptyList();
+        if (handlerLookup.isEmpty()) return Collections.emptyList();
         ArrayList<Handler> flat = new ArrayList<>();
-        for (Map.Entry<Class<?>, CopyOnWriteArraySet<Handler>> e : handlersByType.entrySet()) {
-            Class<?> keyType = e.getKey();
-            if (!keyType.isAssignableFrom(eventClass)) continue;
-            for (Handler h : e.getValue()) {
-                if (!h.receiveSubtypes && keyType != eventClass) continue;
-                flat.add(h);
+        ArrayDeque<Class<?>> queue = new ArrayDeque<>();
+        Set<Class<?>> visited = new HashSet<>();
+        queue.add(eventClass);
+        while (!queue.isEmpty()) {
+            Class<?> type = queue.removeFirst();
+            if (!visited.add(type)) continue;
+            List<Handler> list = handlerLookup.get(type);
+            if (list != null) {
+                if (type == eventClass) {
+                    flat.addAll(list);
+                } else {
+                    for (Handler h : list) {
+                        if (h.receiveSubtypes) flat.add(h);
+                    }
+                }
             }
+            Class<?> superType = type.getSuperclass();
+            if (superType != null) queue.add(superType);
+            Collections.addAll(queue, type.getInterfaces());
         }
         if (flat.isEmpty()) return Collections.emptyList();
         flat.sort(Comparator
